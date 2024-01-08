@@ -1,0 +1,26 @@
+image_width: 1280
+image_height: 1024
+camera_name: Hik_03
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [1871.98922,    0.     ,  692.2802 ,
+            0.     , 1867.69819,  466.61425,
+            0.     ,    0.     ,    1.     ]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.157891, 0.165704, -0.001597, 0.002304, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1., 0., 0.,
+         0., 1., 0.,
+         0., 0., 1.]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [1839.36167,    0.     ,  695.43796,    0.     ,
+            0.     , 1845.69437,  464.98162,    0.     ,
+            0.     ,    0.     ,    1.     ,    0.     ]
