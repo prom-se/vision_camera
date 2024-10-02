@@ -34,7 +34,7 @@ namespace vision
         // declare parameters
         bool use_sensor_data_qos = this->declare_parameter("use_sensor_data_qos", true);
         auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
-        camera_pub_ = image_transport::create_camera_publisher(this, camera_name_+"/image_raw", qos);
+        camera_pub_ = image_transport::create_camera_publisher(this, camera_name_ + "/image_raw", qos);
         declareParameters();
         params_callback_handle_ = this->add_on_set_parameters_callback(
             std::bind(&UsbCamera::parametersCallback, this, std::placeholders::_1));
@@ -106,9 +106,9 @@ namespace vision
 
     void UsbCamera::watchdog_callback()
     {
-        if (cap_->isOpened())
+        if (cam_thread_.joinable())
         {
-            return;
+            cam_thread_.join();
         }
         else
         {
@@ -127,6 +127,10 @@ namespace vision
                     while (rclcpp::ok())
                     {
                         cap_->read(src_);
+                        if (src_.empty())
+                        {
+                            break;
+                        }
                         auto format = src_.type() == CV_8UC1 ? "mono8" : "bgr8";
                         auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), format, src_).toImageMsg();
                         image_msg_.set__data(msg->data);
@@ -134,8 +138,9 @@ namespace vision
                         camera_info_msg_.header = image_msg_.header;
                         camera_pub_.publish(image_msg_, camera_info_msg_);
                     }
+                    cap_->release();
+                    RCLCPP_ERROR(get_logger(), "Camera disconnected!");
                 }};
-            cam_thread_.detach();
         }
     }
 }
