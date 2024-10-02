@@ -1,158 +1,150 @@
 #include "../include/vision_camera/vision_camera_node.hpp"
 
-Camera_node::Camera_node(std::string type,uint8_t index):rclcpp::Node("vision_camera"),
-handle{nullptr},
-isOk{false},
-camType{type},camIndex{index},
-width{1280},height{1024},pixelFormat{PixelType_Gvsp_BayerGR8},expFrameRate{120},
-exposureTime{3000},gain{5.0},
-src{new cv::Mat(height,width,CV_8UC3)}
+namespace vision
 {
-    //设置重启计时器1hz.
-    reopenTimer=create_wall_timer(
-    1s, std::bind(&Camera_node::cameraReopen_callback, this));
+    UsbCamera::UsbCamera(const rclcpp::NodeOptions &options) : Node("usb_camera", options)
+    {
+        RCLCPP_INFO(this->get_logger(), "Starting usb_camera Node!");
+        cap_ = std::make_shared<cv::VideoCapture>();
+        // Load camera info
+        camera_dev_ = this->declare_parameter("camera_dev", "/dev/video0");
+        RCLCPP_INFO(this->get_logger(), "Opening %s", camera_dev_.c_str());
+        camera_name_ = this->declare_parameter("camera_name", "narrow_stereo");
+        camera_info_manager_ =
+            std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
+        auto camera_info_url =
+            this->declare_parameter("camera_info_url", "package://vision_camera/config/camera_info.yaml");
+        if (camera_info_manager_->validateURL(camera_info_url))
+        {
+            camera_info_manager_->loadCameraInfo(camera_info_url);
+            camera_info_msg_ = camera_info_manager_->getCameraInfo();
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "Invalid camera info URL: %s", camera_info_url.c_str());
+        }
 
-    robotSub=create_subscription<vision_interfaces::msg::Robot>(
-        "/serial_driver/robot",rclcpp::SensorDataQoS(),std::bind(&Camera_node::robot_callback,this,std::placeholders::_1));
-    robotPtr=std::make_unique<vision_interfaces::msg::Robot>();
+        // set image_msg info
+        this->image_msg_.set__encoding("bgr8");
+        this->image_msg_.header.set__frame_id("camera_optical_frame");
+        this->image_msg_.set__width(camera_info_msg_.width);
+        this->image_msg_.set__height(camera_info_msg_.height);
+        this->image_msg_.set__step(camera_info_msg_.width * 3);
 
-    tfBroadcaster=std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        // declare parameters
+        bool use_sensor_data_qos = this->declare_parameter("use_sensor_data_qos", true);
+        auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
+        camera_pub_ = image_transport::create_camera_publisher(this, camera_name_ + "/image_raw", qos);
+        declareParameters();
+        params_callback_handle_ = this->add_on_set_parameters_callback(
+            std::bind(&UsbCamera::parametersCallback, this, std::placeholders::_1));
 
-    cameraInfoManager=std::make_unique<camera_info_manager::CameraInfoManager>(this, "Hik_03");
-    auto camera_info_url =this->declare_parameter("camera_info_url", "package://vision_camera/config/hik_03_config.yaml");
-    cameraInfoManager->loadCameraInfo(camera_info_url);
-
-    camPub= create_publisher<sensor_msgs::msg::Image>("/vision_camera/image_raw",rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_default)));
-    infoPub= create_publisher<sensor_msgs::msg::CameraInfo>("/vision_camera/camera_info",rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_default)));
-
-    isOk = camType=="hik"?initHikCam():initUsbCam(camType);
-}
-
-Camera_node::~Camera_node(){
-
-}
-
-bool Camera_node::initHikCam(){ 
-    MV_CC_DEVICE_INFO_LIST stDeviceList;
-    int nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &stDeviceList);
-    if(stDeviceList.nDeviceNum!=0){
-        MV_CC_CreateHandle(&handle, stDeviceList.pDeviceInfo[camIndex]);
-        nRet = MV_CC_OpenDevice(handle);
+        // set 1hz watchdog
+        using namespace std::chrono_literals;
+        watchdog_timer_ = create_wall_timer(1s, std::bind(&UsbCamera::watchdog_callback, this));
     }
-    else{
-        RCLCPP_FATAL(get_logger(),"未找到海康相机！");
-        return false;
-    }
-    if(nRet==MV_OK){
-        RCLCPP_INFO(get_logger(),"成功打开海康相机[%d]!",camIndex);
-        MV_CC_SetIntValue(handle, "Width", width);
-        MV_CC_SetIntValue(handle, "Height", height);
-        MV_CC_SetPixelFormat(handle, pixelFormat);
-        MV_CC_SetFloatValue(handle, "ExposureTime", exposureTime);
-        MV_CC_SetFloatValue(handle, "Gain", gain);
-        MV_CC_SetFrameRate(handle,expFrameRate);
-        MV_CC_SetEnumValue(handle, "TriggerMode", MV_TRIGGER_MODE_OFF);
-        MV_CC_SetEnumValue(handle, "AcquisitionMode", MV_ACQ_MODE_CONTINUOUS);
-        MV_CC_RegisterImageCallBackEx(handle,&Camera_node::hikImgCallback,this);
-        MV_CC_StartGrabbing(handle);
-        return true;
-    }
-    else{
-        RCLCPP_ERROR(get_logger(),"打开海康相机[%d]失败!",camIndex);
-        return false;
-    }
-}
 
-bool Camera_node::initUsbCam(std::string type){
-    if(type=="usb"){
-        usbCam.open(camIndex);
+    UsbCamera::~UsbCamera()
+    {
+        if (cam_thread_.joinable())
+        {
+            cam_thread_.join();
+            cap_->release();
+        }
     }
-    else if(type=="video"){
-        usbCam.open("/home/promise/video/aprilTag.mp4");
-    }
-    else{
-        RCLCPP_FATAL(get_logger(),"错误摄像头类型!");
-        return false;
-    }
-    bool ret = usbCam.isOpened();
-    if(ret){
-        std::thread{[this]() -> void {
-            int frameCounter = 0;
-            while(rclcpp::ok()){
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000/60));
-                usbCam >> *src;
-                frameCounter += 1;
-                if (frameCounter == int(usbCam.get(cv::CAP_PROP_FRAME_COUNT))){
-                    frameCounter = 0;
-                    usbCam.set(cv::CAP_PROP_POS_FRAMES, 0);
-                }
-                auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", *this->src).toImageMsg();
 
-                sensor_msgs::msg::CameraInfo info;
-                info=cameraInfoManager->getCameraInfo();
-                info.header=msg->header;
-                this->camPub->publish(*msg);
+    void UsbCamera::declareParameters()
+    {
+        rcl_interfaces::msg::ParameterDescriptor param_desc;
+        param_desc.integer_range.resize(1);
+        param_desc.integer_range[0].step = 1;
+        // Exposure time
+        param_desc.description = "Exposure time in microseconds";
+        param_desc.integer_range[0].from_value = 100;
+        param_desc.integer_range[0].to_value = 20000;
+        auto exposure_time = this->declare_parameter("exposure_time", 1000, param_desc);
+        RCLCPP_INFO(this->get_logger(), "Exposure time: %ld", exposure_time);
+
+        // Gain
+        param_desc.description = "Gain";
+        param_desc.integer_range[0].from_value = 0;
+        param_desc.integer_range[0].to_value = 50;
+        auto gain = this->declare_parameter("gain", 0, param_desc);
+        RCLCPP_INFO(this->get_logger(), "Gain: %ld", gain);
+
+        // FPS
+        param_desc.description = "FPS";
+        param_desc.integer_range[0].from_value = 30;
+        param_desc.integer_range[0].to_value = 120;
+        auto fps = this->declare_parameter("fps", 30, param_desc);
+        RCLCPP_INFO(this->get_logger(), "fps: %ld", fps);
+    }
+
+    rcl_interfaces::msg::SetParametersResult UsbCamera::parametersCallback(
+        const std::vector<rclcpp::Parameter> &parameters)
+    {
+        rcl_interfaces::msg::SetParametersResult result;
+        result.successful = true;
+        for (const auto &param : parameters)
+        {
+            if (param.get_name() == "exposure_time")
+            {
+                cap_->set(cv::CAP_PROP_EXPOSURE, (double)param.as_int());
             }
-        }}.detach();
-        RCLCPP_INFO(get_logger(),"打开USB摄像头成功!");
-        return true;
+            else if (param.get_name() == "gain")
+            {
+                cap_->set(cv::CAP_PROP_GAIN, (double)param.as_int());
+            }
+            else
+            {
+                result.successful = false;
+                result.reason = "Unknown parameter: " + param.get_name();
+            }
+        }
+        return result;
     }
-    else{
-        RCLCPP_FATAL(get_logger(),"打开USB摄像头失败!");
-        return false;
+
+    void UsbCamera::watchdog_callback()
+    {
+        if (cam_thread_.joinable())
+        {
+            cam_thread_.join();
+        }
+        else
+        {
+            cap_ = std::make_shared<cv::VideoCapture>(camera_dev_, cv::CAP_V4L);
+            cap_->set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+            cap_->set(cv::CAP_PROP_FRAME_WIDTH, camera_info_msg_.width);
+            cap_->set(cv::CAP_PROP_FRAME_HEIGHT, camera_info_msg_.height);
+            cap_->set(cv::CAP_PROP_FPS, (double)this->get_parameter("fps").as_int());
+            cap_->set(cv::CAP_PROP_AUTO_EXPOSURE, 1); // 1为手动曝光，3为自动曝光
+            cap_->set(cv::CAP_PROP_EXPOSURE, (double)this->get_parameter("exposure_time").as_int());
+            cap_->set(cv::CAP_PROP_GAIN, (double)this->get_parameter("gain").as_int());
+            cap_->set(cv::CAP_PROP_AUTO_WB, 1);
+            cam_thread_ = std::thread{
+                [this]() -> void
+                {
+                    while (rclcpp::ok())
+                    {
+                        cap_->read(src_);
+                        if (src_.empty())
+                        {
+                            break;
+                        }
+                        auto format = src_.type() == CV_8UC1 ? "mono8" : "bgr8";
+                        auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), format, src_).toImageMsg();
+                        image_msg_.set__data(msg->data);
+                        image_msg_.header.set__stamp(now());
+                        camera_info_msg_.header = image_msg_.header;
+                        camera_pub_.publish(image_msg_, camera_info_msg_);
+                    }
+                    cap_->release();
+                    RCLCPP_ERROR(get_logger(), "Camera disconnected!");
+                }};
+        }
     }
 }
 
-void Camera_node::cameraReopen_callback(){
-    if(!isOk){
-        RCLCPP_WARN(get_logger(),"重启摄像头...");
-        isOk = camType=="hik"?initHikCam():initUsbCam(camType);
-    }
-}
+#include "rclcpp_components/register_node_macro.hpp"
 
-void Camera_node::hikImgCallback(unsigned char * pData, MV_FRAME_OUT_INFO_EX* pFrameInfo, void* pUser){
-    const Camera_node *thisPtr = (Camera_node*)pUser;
-    cv::Mat src = cv::Mat(pFrameInfo->nHeight, pFrameInfo->nWidth, CV_8UC1);
-    memcpy(src.data, pData, pFrameInfo->nWidth * pFrameInfo->nHeight * 1);
-    cv::cvtColor(src, *thisPtr->src, cv::COLOR_BayerGR2BGR_EA);
-    auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", *thisPtr->src).toImageMsg();
-
-    sensor_msgs::msg::CameraInfo info;
-    info=thisPtr->cameraInfoManager->getCameraInfo();
-    info.header=msg->header;
-    thisPtr->camPub->publish(*msg);
-    thisPtr->infoPub->publish(info);
-}
-
-void Camera_node::robot_callback(const vision_interfaces::msg::Robot robot){
-    try{
-        *robotPtr=robot;
-    }
-    catch(std::system_error &error){
-        RCLCPP_ERROR(get_logger(),"获取机器人信息时发生错误.");
-    }
-    tf2::Quaternion q;
-    q.setRPY(0,robotPtr->self_pitch*M_PI/180.0,robotPtr->self_yaw*M_PI/180.0);
-    q.normalize();
-    geometry_msgs::msg::TransformStamped t;
-    t.header.stamp = this->get_clock()->now();
-    t.header.frame_id = "world";
-    t.child_frame_id = "camera";
-    t.transform.rotation.x=q.x();
-    t.transform.rotation.y=q.y();
-    t.transform.rotation.z=q.z();
-    t.transform.rotation.w=q.w();
-    tfBroadcaster->sendTransform(t);
-}
-
-int main(int argc, char *argv[]){
-    rclcpp::init(argc,argv);
-
-    std::string camType=argc>1?argv[1]:"hik";
-    uint8_t camIndex = std::stoi(argc>2?argv[2]:"0");
-    auto node = std::make_shared<Camera_node>(camType,camIndex);
-
-    rclcpp::spin(node);
-    rclcpp::shutdown();
-    return 0;
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(vision::UsbCamera)
