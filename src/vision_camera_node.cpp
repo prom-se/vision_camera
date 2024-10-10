@@ -112,7 +112,7 @@ namespace vision
         }
         else
         {
-            cap_ = std::make_shared<cv::VideoCapture>(camera_dev_, cv::CAP_V4L);
+            cap_ = std::make_shared<cv::VideoCapture>(camera_dev_);
             cap_->set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
             cap_->set(cv::CAP_PROP_FRAME_WIDTH, camera_info_msg_.width);
             cap_->set(cv::CAP_PROP_FRAME_HEIGHT, camera_info_msg_.height);
@@ -130,6 +130,10 @@ namespace vision
                         if (src_.empty())
                         {
                             break;
+                        }
+                        if (cap_->get(cv::CAP_PROP_POS_FRAMES) == cap_->get(cv::CAP_PROP_FRAME_COUNT))
+                        {
+                            cap_->set(cv::CAP_PROP_POS_FRAMES, 0);
                         }
                         auto format = src_.type() == CV_8UC1 ? "mono8" : "bgr8";
                         auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), format, src_).toImageMsg();
